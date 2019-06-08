@@ -53,31 +53,33 @@ func performBackup(dest string) error {
 
 	bg := context.Background()
 
-	networks, err := cli.NetworkList(bg, dockertypes.NetworkListOptions{})
+	networkFilter := filters.NewArgs()
+	networkFilter.Add("scope", "swarm")
+
+	networks, err := cli.NetworkList(bg, dockertypes.NetworkListOptions{Filters: networkFilter})
 	if err != nil {
 		return err
 	}
 
 	e.Backup.Networks = map[string]dockertypes.NetworkCreate{}
 	networkIdNames := map[string]string{}
-	skipNetworks := map[string]bool{"bridge": true, "docker_gwbridge": true, "ingress": true, "host": true, "none": true}
+	skipNetworks := map[string]bool{"bridge": true, "ingress": true}
 
 	for _, network := range networks {
 		spec := dockertypes.NetworkCreate{
 			Driver:     network.Driver,
 			EnableIPv6: network.EnableIPv6,
-			IPAM:       &network.IPAM,
 			Internal:   network.Internal,
 			Attachable: network.Attachable,
-			Options:    network.Options,
 			Labels:     network.Labels,
+			Scope:      network.Scope,
 		}
+
+		networkIdNames[network.ID] = network.Name
 
 		if skipNetworks[network.Name] {
 			continue
 		}
-
-		networkIdNames[network.ID] = network.Name
 		e.Backup.Networks[network.Name] = spec
 	}
 
@@ -101,11 +103,25 @@ func performBackup(dest string) error {
 
 		serviceSpec := service.Spec
 		for i, n := range serviceSpec.Networks {
-			serviceSpec.Networks[i].Target = networkIdNames[n.Target]
+			netName, ok := networkIdNames[n.Target]
+
+			if !ok {
+				networkIdNames = e.fetchUnknownNetwork(n.Target, networkIdNames)
+				netName = networkIdNames[n.Target]
+			}
+
+			serviceSpec.Networks[i].Target = netName
 		}
 
 		for i, n := range serviceSpec.TaskTemplate.Networks {
-			serviceSpec.TaskTemplate.Networks[i].Target = networkIdNames[n.Target]
+			netName, ok := networkIdNames[n.Target]
+
+			if !ok {
+				networkIdNames = e.fetchUnknownNetwork(n.Target, networkIdNames)
+				netName = networkIdNames[n.Target]
+			}
+
+			serviceSpec.TaskTemplate.Networks[i].Target = netName
 		}
 
 		for i, _ := range serviceSpec.TaskTemplate.ContainerSpec.Secrets {
@@ -130,6 +146,22 @@ func performBackup(dest string) error {
 	}
 
 	return ioutil.WriteFile(dest, bjson, os.FileMode(0600))
+}
+
+func (e *Evacuation) fetchUnknownNetwork(id string, netMap map[string]string) map[string]string {
+	net, err := e.cli.NetworkInspect(context.Background(), id, dockertypes.NetworkInspectOptions{Verbose: true})
+	if err != nil {
+		panic(err)
+	}
+	netMap[net.ID] = net.Name
+
+	if _, ok := e.Backup.Networks[net.Name]; ok {
+		fmt.Printf("Fetched dual-scope network: %s (%s)\n", net.Name, net.ID)
+	} else {
+		fmt.Printf("Fetched non-swarm scope network: %s (%s)\n", net.Name, net.ID)
+	}
+
+	return netMap
 }
 
 func (e *Evacuation) LoadSecretsData() error {
@@ -194,7 +226,7 @@ func (e *Evacuation) LoadSecretsData() error {
 	tries := 0
 
 	for {
-		if tries > 10 {
+		if tries > 60 { // 5 mins is enough?
 			return errors.New("failed to create export container")
 		}
 		containers, _ := e.cli.ContainerList(bg, dockertypes.ContainerListOptions{Filters: containerFilter})
